@@ -268,15 +268,6 @@
             line-height: 1.35;
             margin-top: 2px;
         }
-        .search-empty {
-            padding: 16px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: var(--md-on-surface-variant);
-            font-size: 13px;
-            font-weight: 600;
-        }
 
         .icon-btn {
             background: none; border: none; color: var(--md-on-surface-variant);
@@ -607,7 +598,6 @@
         @keyframes spin { to { transform: rotate(360deg); } }
         .loading-txt { color: var(--md-on-surface-variant); font-size: 14px; font-weight: 500; }
 
-        /* ===== FAB ===== */
         /* ===== SNACKBAR ===== */
         .snackbar {
             position: fixed; bottom: 24px; left: 50%;
@@ -748,7 +738,7 @@
 
 <script>
 // ===== State =====
-let LAT = 55.75, LON = 37.62;
+let LAT = 55.7558, LON = 37.6173; // По умолчанию Москва
 let currentLayerType = 'rain';
 let currentSunrise = null, currentSunset = null;
 let citySuggestions = [];
@@ -915,7 +905,7 @@ function buildWeatherTip(cur, daily) {
     };
 }
 
-// ===== Hidden multi-model weather consensus =====
+// ===== Weather Consensus Models =====
 const WEATHER_CONSENSUS_MODELS = [
     'best_match',
     'icon_seamless',
@@ -1046,17 +1036,23 @@ function buildConsensusForecast(models) {
     };
 }
 async function fetchConsensusForecast() {
-    const settled = await Promise.allSettled(WEATHER_CONSENSUS_MODELS.map(model => fetchForecastModel(model)));
-    const successful = settled
-        .filter(item => item.status === 'fulfilled')
-        .map(item => item.value);
+    try {
+        const settled = await Promise.allSettled(WEATHER_CONSENSUS_MODELS.map(model => fetchForecastModel(model)));
+        const successful = settled
+            .filter(item => item.status === 'fulfilled')
+            .map(item => item.value)
+            .filter(m => m && m.current && m.hourly && m.daily);
 
-    if (!successful.length) {
-        const fallback = await fetchForecastModel('');
-        return buildConsensusForecast([fallback]);
+        if (successful.length > 0) {
+            return buildConsensusForecast(successful);
+        }
+    } catch (e) {
+        console.warn("Попытка мультимодельного консенсуса не удалась, переход на стандартный запрос.", e);
     }
 
-    return buildConsensusForecast(successful);
+    // Полный резервный вариант — один стандартный запрос прогноза Open-Meteo
+    const fallback = await fetchForecastModel('');
+    return buildConsensusForecast([fallback]);
 }
 
 // ===== Utils =====
@@ -1110,21 +1106,26 @@ function buildLocationLabel(address = {}) {
     return parts.length ? parts.join(', ') : '';
 }
 async function fetchNominatimSuggestions(query) {
-    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&accept-language=ru&addressdetails=1&limit=8&q=${encodeURIComponent(query)}`, {
-        signal: searchSuggestAbort.signal,
-        headers: { 'Accept': 'application/json' }
-    });
-    const d = await r.json();
-    return (d || []).map(item => ({
-        name: item.name || item.address?.city_district || item.address?.suburb || item.address?.city || item.display_name?.split(',')[0] || 'Локация',
-        admin1: item.address?.city || item.address?.town || item.address?.village || item.address?.county || '',
-        admin2: item.address?.state || '',
-        country: item.address?.country || '',
-        latitude: Number(item.lat),
-        longitude: Number(item.lon),
-        display_name: item.display_name || '',
-        source: 'nominatim'
-    })).filter(item => Number.isFinite(item.latitude) && Number.isFinite(item.longitude));
+    try {
+        const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&accept-language=ru&addressdetails=1&limit=5&q=${encodeURIComponent(query)}`, {
+            signal: searchSuggestAbort.signal,
+            headers: { 'Accept': 'application/json' }
+        });
+        if (!r.ok) return [];
+        const d = await r.json();
+        return (d || []).map(item => ({
+            name: item.name || item.address?.city_district || item.address?.suburb || item.address?.city || item.display_name?.split(',')[0] || 'Локация',
+            admin1: item.address?.city || item.address?.town || item.address?.village || item.address?.county || '',
+            admin2: item.address?.state || '',
+            country: item.address?.country || '',
+            latitude: Number(item.lat),
+            longitude: Number(item.lon),
+            display_name: item.display_name || '',
+            source: 'nominatim'
+        })).filter(item => Number.isFinite(item.latitude) && Number.isFinite(item.longitude));
+    } catch (e) {
+        return [];
+    }
 }
 function formatSuggestionLabel(item) {
     const main = item.display_name
@@ -1259,20 +1260,20 @@ function doSearch() {
     fetchCity(q);
 }
 
-// ===== Geolocation: IP first, then GPS =====
+// ===== Geolocation: IP first, then fallback silently to default coordinates =====
 async function initLocation() {
     showLoading('Определяем местоположение...');
-    let gotIP = false;
+    let gotLocation = false;
     try {
         const ipApis = [
+            'https://ipwho.is/',
             'https://ipapi.co/json/',
-            'https://ip-api.com/json/?lang=ru',
-            'https://ipwho.is/'
+            'https://ip-api.com/json/?lang=ru'
         ];
         for (const apiUrl of ipApis) {
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 3000);
+                const timeoutId = setTimeout(() => controller.abort(), 2500);
                 const r = await fetch(apiUrl, {
                     signal: controller.signal,
                     headers: { 'Accept': 'application/json' }
@@ -1284,11 +1285,10 @@ async function initLocation() {
                 if (ipLocation) {
                     LAT = ipLocation.latitude;
                     LON = ipLocation.longitude;
-                    gotIP = true;
+                    gotLocation = true;
                     const cityName = ipLocation.city || '';
                     const country = ipLocation.country || '';
                     const label = [cityName, country].filter(Boolean).join(', ');
-                    if (cityName) snack(`📍 Определено по IP: ${cityName}`);
                     fetchWeather(label || undefined);
                     break;
                 }
@@ -1296,40 +1296,35 @@ async function initLocation() {
         }
     } catch(e) {}
 
-    if (gotIP) { tryGPS(true); }
-    else { tryGPS(false); }
+    // Если IP-геолокация не сработала, бесшумно загружаем дефолтный город (Москва) без ошибок
+    if (!gotLocation) {
+        LAT = 55.7558;
+        LON = 37.6173;
+        fetchWeather('Москва');
+    }
 }
 
-function tryGPS(silent) {
+// Запрос геопозиции только при явном клике пользователя на кнопку GPS
+function geoLocate() {
+    showLoading('Определяем местоположение...');
     if (!navigator.geolocation) {
-        if (!silent) { snack('Геолокация недоступна — Москва'); fetchCity('Москва'); }
+        snack('Геолокация недоступна в этом браузере');
+        fetchWeather();
         return;
     }
+    snack('📍 Запрос доступа к геопозиции...');
     navigator.geolocation.getCurrentPosition(
         p => {
             LAT = p.coords.latitude;
             LON = p.coords.longitude;
-            if (silent) snack('📍 Уточнено по GPS');
+            snack('📍 Координаты успешно обновлены по GPS');
             fetchWeather();
         },
         err => {
-            if (!silent) {
-                snack('Геолокация недоступна — Москва');
-                fetchCity('Москва');
-            }
+            snack('Не удалось получить координаты. Пожалуйста, разрешите доступ в настройках.');
+            fetchWeather();
         },
-        { timeout: 10000, enableHighAccuracy: true, maximumAge: 300000 }
-    );
-}
-
-function geoLocate() {
-    showLoading('Определяем местоположение...');
-    if (!navigator.geolocation) { initLocation(); return; }
-    snack('📍 Определяем местоположение...');
-    navigator.geolocation.getCurrentPosition(
-        p => { LAT = p.coords.latitude; LON = p.coords.longitude; fetchWeather(); },
-        () => { initLocation(); },
-        { timeout: 8000, enableHighAccuracy: true }
+        { timeout: 8000, enableHighAccuracy: true, maximumAge: 300000 }
     );
 }
 
@@ -1338,26 +1333,47 @@ async function fetchCity(name) {
     try {
         let chosen = null;
 
-        const nominatimRes = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&accept-language=ru&addressdetails=1&limit=1&q=${encodeURIComponent(name)}`);
-        const nominatimData = await nominatimRes.json();
-        if (Array.isArray(nominatimData) && nominatimData.length) {
-            const item = nominatimData[0];
-            chosen = {
-                latitude: Number(item.lat),
-                longitude: Number(item.lon),
-                label: buildLocationLabel(item.address) || item.display_name || name
-            };
+        // Попробуем сначала быстрый и стабильный API Open-Meteo Geocoding
+        try {
+            const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=ru&format=json`);
+            if (r.ok) {
+                const d = await r.json();
+                if (d.results && d.results.length > 0) {
+                    chosen = {
+                        latitude: d.results[0].latitude,
+                        longitude: d.results[0].longitude,
+                        label: [d.results[0].name, d.results[0].country].filter(Boolean).join(', ')
+                    };
+                }
+            }
+        } catch(e) {
+            console.warn("Ошибка Geocoding API, пробуем Nominatim...", e);
+        }
+
+        // Если Open-Meteo не нашёл, пробуем резервный Nominatim
+        if (!chosen) {
+            try {
+                const nominatimRes = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&accept-language=ru&addressdetails=1&limit=1&q=${encodeURIComponent(name)}`);
+                if (nominatimRes.ok) {
+                    const nominatimData = await nominatimRes.json();
+                    if (Array.isArray(nominatimData) && nominatimData.length) {
+                        const item = nominatimData[0];
+                        chosen = {
+                            latitude: Number(item.lat),
+                            longitude: Number(item.lon),
+                            label: buildLocationLabel(item.address) || item.display_name || name
+                        };
+                    }
+                }
+            } catch(e) {
+                console.warn("Ошибка Nominatim", e);
+            }
         }
 
         if (!chosen) {
-            const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=ru&format=json`);
-            const d = await r.json();
-            if (!d.results || d.results.length === 0) { snack('Место не найдено'); return; }
-            chosen = {
-                latitude: d.results[0].latitude,
-                longitude: d.results[0].longitude,
-                label: [d.results[0].name, d.results[0].country].filter(Boolean).join(', ')
-            };
+            snack('Место не найдено');
+            fetchWeather(); // Возвращаем текущую погоду
+            return;
         }
 
         LAT = chosen.latitude;
@@ -1367,7 +1383,11 @@ async function fetchCity(name) {
         citySuggestions = [];
         activeSuggestionIndex = -1;
         fetchWeather(chosen.label);
-    } catch (e) { snack('Ошибка поиска'); console.error(e); }
+    } catch (e) {
+        snack('Ошибка поиска');
+        console.error(e);
+        fetchWeather();
+    }
 }
 
 async function fetchWeather(cityName) {
@@ -1377,9 +1397,14 @@ async function fetchWeather(cityName) {
         if (!city) {
             try {
                 const rgr = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${LAT}&lon=${LON}&format=jsonv2&addressdetails=1&accept-language=ru`);
-                const rgd = await rgr.json();
-                city = buildLocationLabel(rgd.address) || rgd.display_name || `${LAT.toFixed(2)}°, ${LON.toFixed(2)}°`;
+                if (rgr.ok) {
+                    const rgd = await rgr.json();
+                    city = buildLocationLabel(rgd.address) || rgd.display_name;
+                }
             } catch(e) {
+                console.warn("Обратное геокодирование не удалось:", e);
+            }
+            if (!city) {
                 city = `${LAT.toFixed(2)}°, ${LON.toFixed(2)}°`;
             }
         }
@@ -1392,7 +1417,7 @@ async function fetchWeather(cityName) {
 
         render(data, city);
     } catch (e) {
-        snack('Ошибка загрузки данных');
+        snack('Ошибка загрузки данных погоды');
         console.error(e);
         document.getElementById('app').innerHTML = `
             <div class="loading">
@@ -1607,7 +1632,7 @@ function render(data, city) {
     document.getElementById('app').innerHTML = html;
     currentLayerType = 'rain';
 
-    // Initialize scroll-reveal observer
+    // Инициализация scroll-reveal анимации
     requestAnimationFrame(() => {
         initRevealObserver();
         setTimeout(initMap, 120);
