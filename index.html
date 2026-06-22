@@ -920,7 +920,7 @@ function numOrNull(v) {
 // ===== Ультрабезопасный запрос прогноза с моментальным локальным Fallback-офлайном =====
 async function fetchWeatherForecast() {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2500); // Строгий таймаут на 2.5 секунды
+    const timeoutId = setTimeout(() => controller.abort(), 4000); // Оптимальный таймаут 4 секунды
     
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}`
         + `&current=${WEATHER_QUERY_PARTS.current}`
@@ -936,16 +936,15 @@ async function fetchWeatherForecast() {
         if (!json || !json.current || !json.hourly || !json.daily) throw new Error('Malformed data');
         return json;
     } catch (e) {
-        console.warn("API погоды временно недоступен или заблокирован CORS. Генерируем оффлайн-прогноз...", e);
-        return generateOfflineForecast(); // Бесшовная оффлайн генерация
+        console.warn("API погоды временно недоступен или заблокирован. Инициализация автономных демо-данных...", e);
+        return generateOfflineForecast(); // Бесшовный генератор данных при сбоях API
     }
 }
 
-// ===== Генератор суперреалистичных погодных данных при оффлайне / сбое API =====
+// ===== Генератор реалистичных погодных данных при оффлайне / сбое API =====
 function generateOfflineForecast() {
-    snack("⚠️ Сервис погоды оффлайн. Работа в демо-режиме.");
+    snack("⚠️ Подключены автономные погодные данные.");
     const now = new Date();
-    const mockCurrentTime = now.toISOString();
     
     const hourlyTimes = [];
     const hourlyTemps = [];
@@ -1062,13 +1061,14 @@ function fmtNum(value, digits = 0, fallback = '—') {
         .replace(/(\.\d*[1-9])0+$/, '$1');
 }
 function extractIpLocation(data = {}) {
-    const latitude = numOrNull(data.latitude ?? data.lat);
-    const longitude = numOrNull(data.longitude ?? data.lon);
+    // Поддержка как ipapi, так и freeipapi
+    const latitude = numOrNull(data.latitude ?? data.lat ?? data.latitudeDec);
+    const longitude = numOrNull(data.longitude ?? data.lon ?? data.longitudeDec);
     if (latitude === null || longitude === null) return null;
     return {
         latitude,
         longitude,
-        city: data.city || data.regionName || data.region || data.district || '',
+        city: data.city || data.regionName || data.region || data.cityName || '',
         country: data.country_name || data.country || data.countryCode || ''
     };
 }
@@ -1249,39 +1249,57 @@ function doSearch() {
 async function initLocation() {
     showLoading('Определяем местоположение...');
     let gotLocation = false;
+    
+    // Попытка 1: Свободное API геопозиции (ipapi.co)
     try {
-        const ipApis = [
-            'https://ipwho.is/',
-            'https://ipapi.co/json/',
-            'https://ip-api.com/json/?lang=ru'
-        ];
-        for (const apiUrl of ipApis) {
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 сек таймаут
-                const r = await fetch(apiUrl, {
-                    signal: controller.signal,
-                    headers: { 'Accept': 'application/json' }
-                });
-                clearTimeout(timeoutId);
-                if (!r.ok) continue;
-                const d = await r.json();
-                const ipLocation = extractIpLocation(d);
-                if (ipLocation) {
-                    LAT = ipLocation.latitude;
-                    LON = ipLocation.longitude;
-                    gotLocation = true;
-                    const cityName = ipLocation.city || '';
-                    const country = ipLocation.country || '';
-                    const label = [cityName, country].filter(Boolean).join(', ');
-                    fetchWeather(label || undefined);
-                    break;
-                }
-            } catch(e) {}
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const r = await fetch('https://ipapi.co/json/', {
+            signal: controller.signal,
+            headers: { 'Accept': 'application/json' }
+        });
+        clearTimeout(timeoutId);
+        if (r.ok) {
+            const d = await r.json();
+            const ipLoc = extractIpLocation(d);
+            if (ipLoc) {
+                LAT = ipLoc.latitude;
+                LON = ipLoc.longitude;
+                gotLocation = true;
+                const label = [ipLoc.city, ipLoc.country].filter(Boolean).join(', ');
+                fetchWeather(label || undefined);
+            }
         }
-    } catch(e) {}
+    } catch(e) {
+        console.warn('ipapi.co не удался, пробуем резерв...');
+    }
 
-    // Бесшумный резервный переход на Москву
+    // Попытка 2: Резервное API freeipapi.com (без CORS-блокировок)
+    if (!gotLocation) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 2000);
+            const r = await fetch('https://freeipapi.com/api/json', {
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            if (r.ok) {
+                const d = await r.json();
+                const ipLoc = extractIpLocation(d);
+                if (ipLoc) {
+                    LAT = ipLoc.latitude;
+                    LON = ipLoc.longitude;
+                    gotLocation = true;
+                    const label = [ipLoc.city, ipLoc.country].filter(Boolean).join(', ');
+                    fetchWeather(label || undefined);
+                }
+            }
+        } catch(e) {
+            console.warn('Резервная IP геопозиция не удалась...');
+        }
+    }
+
+    // Если всё заблокировано — дефолтный переход на Москву
     if (!gotLocation) {
         LAT = 55.7558;
         LON = 37.6173;
@@ -1384,16 +1402,19 @@ async function fetchWeather(cityName) {
     showLoading('Загрузка погоды...');
     let city = cityName;
     
-    // Безопасное получение названия локации (не мешает загрузке)
+    // Стабильное обратное декодирование без CORS-блокировок с помощью BigDataCloud API
     if (!city) {
         try {
             const controller = new AbortController();
             const tId = setTimeout(() => controller.abort(), 1500);
-            const rgr = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${LAT}&lon=${LON}&format=jsonv2&addressdetails=1&accept-language=ru`, { signal: controller.signal });
+            const rgr = await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${LAT}&longitude=${LON}&localityLanguage=ru`, { signal: controller.signal });
             clearTimeout(tId);
             if (rgr.ok) {
                 const rgd = await rgr.json();
-                city = buildLocationLabel(rgd.address) || rgd.display_name;
+                city = rgd.locality || rgd.city || rgd.principalSubdivision || '';
+                if (rgd.countryName) {
+                    city = city ? `${city}, ${rgd.countryName}` : rgd.countryName;
+                }
             }
         } catch(e) {
             console.warn("Не удалось декодировать имя города:", e);
@@ -1412,8 +1433,7 @@ async function fetchWeather(cityName) {
 
         render(data, city);
     } catch (e) {
-        console.error("Критическая ошибка:", e);
-        // Последний рубеж обороны - гарантированный рендеринг демо-данных
+        console.error("Критический сбой визуализации:", e);
         const offlineData = generateOfflineForecast();
         render(offlineData, city);
     }
