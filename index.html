@@ -382,6 +382,7 @@
             width: 42px; height: 42px; border-radius: 50%;
             background: var(--md-primary-container); color: var(--md-on-primary-container);
             display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0;
             transition: all 0.3s;
         }
         .stat:hover .stat-ic { transform: scale(1.15) rotate(5deg); }
@@ -853,7 +854,7 @@ function getInfoBanner(type, data = {}) {
             badge: 'Сводка',
             title: 'Кратко по погоде',
             desc: `Сейчас ${Math.round(data.temp ?? 0)}°, ощущается как ${Math.round(data.feels ?? 0)}°. ${data.desc || 'Погодные условия обновлены'}.`,
-            meta: `Влажность ${fmtNum(data.humidity)}% · ветер ${fmtNum(data.wind, 1)} м/с${data.consensusCount ? ` · консенсус ${data.consensusCount} моделей` : ''}`
+            meta: `Влажность ${fmtNum(data.humidity)}% · ветер ${fmtNum(data.wind, 1)} м/с`
         },
         map: {
             icon: 'radar',
@@ -905,154 +906,28 @@ function buildWeatherTip(cur, daily) {
     };
 }
 
-// ===== Weather Consensus Models =====
-const WEATHER_CONSENSUS_MODELS = [
-    'best_match',
-    'icon_seamless',
-    'gfs_seamless',
-    'meteofrance_seamless',
-    'jma_seamless',
-    'gem_seamless'
-];
 const WEATHER_QUERY_PARTS = {
     current: 'temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m',
     hourly: 'temperature_2m,weather_code,precipitation_probability,precipitation,is_day,wind_speed_10m',
     daily: 'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,uv_index_max'
 };
+
 function numOrNull(v) {
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
 }
-function avgValues(values, fallback = 0) {
-    const nums = values.map(numOrNull).filter(v => v !== null);
-    return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : fallback;
-}
-function modeValue(values, fallback = null) {
-    const items = values.filter(v => v !== undefined && v !== null && v !== '');
-    if (!items.length) return fallback;
-    const counts = new Map();
-    let best = items[0];
-    let bestCount = 0;
-    for (const value of items) {
-        const key = typeof value === 'string' ? value : JSON.stringify(value);
-        const next = (counts.get(key)?.count || 0) + 1;
-        counts.set(key, { count: next, value });
-        if (next > bestCount) {
-            bestCount = next;
-            best = value;
-        }
-    }
-    return best;
-}
-function avgAngle(values, fallback = 0) {
-    const nums = values.map(numOrNull).filter(v => v !== null);
-    if (!nums.length) return fallback;
-    const x = nums.reduce((sum, v) => sum + Math.cos(v * Math.PI / 180), 0) / nums.length;
-    const y = nums.reduce((sum, v) => sum + Math.sin(v * Math.PI / 180), 0) / nums.length;
-    let deg = Math.atan2(y, x) * 180 / Math.PI;
-    if (deg < 0) deg += 360;
-    return deg;
-}
-function avgIsoDate(values, fallback = '') {
-    const times = values.map(v => new Date(v).getTime()).filter(Number.isFinite);
-    if (!times.length) return fallback;
-    return new Date(Math.round(times.reduce((a, b) => a + b, 0) / times.length)).toISOString();
-}
-function getBaseForecast(models) {
-    return models.find(m => m?.current && m?.hourly && m?.daily) || models[0] || null;
-}
-function aggregateSeries(models, section, field, strategy = 'avg') {
-    const base = getBaseForecast(models);
-    const baseArray = base?.[section]?.[field];
-    if (!Array.isArray(baseArray)) return [];
-    return baseArray.map((fallbackValue, index) => {
-        const values = models
-            .map(model => model?.[section]?.[field]?.[index])
-            .filter(v => v !== undefined && v !== null);
-        if (!values.length) return fallbackValue;
-        if (strategy === 'mode') return modeValue(values, fallbackValue);
-        if (strategy === 'iso') return avgIsoDate(values, fallbackValue);
-        return avgValues(values, numOrNull(fallbackValue) ?? 0);
-    });
-}
-function buildForecastUrl(model = '') {
-    return `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}`
+
+// ===== Одиночный, надёжный и быстрый запрос прогноза =====
+async function fetchWeatherForecast() {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}`
         + `&current=${WEATHER_QUERY_PARTS.current}`
         + `&hourly=${WEATHER_QUERY_PARTS.hourly}`
         + `&daily=${WEATHER_QUERY_PARTS.daily}`
-        + `&timezone=auto&forecast_days=7`
-        + (model ? `&models=${encodeURIComponent(model)}` : '');
-}
-async function fetchForecastModel(model) {
-    const res = await fetch(buildForecastUrl(model));
-    if (!res.ok) throw new Error(`Weather model failed: ${model || 'default'}`);
-    const data = await res.json();
-    data._model = model || 'default';
-    return data;
-}
-function buildConsensusForecast(models) {
-    const base = getBaseForecast(models);
-    if (!base) throw new Error('No forecast data available');
-    return {
-        current: {
-            temperature_2m: avgValues(models.map(m => m?.current?.temperature_2m), base.current.temperature_2m),
-            relative_humidity_2m: avgValues(models.map(m => m?.current?.relative_humidity_2m), base.current.relative_humidity_2m),
-            apparent_temperature: avgValues(models.map(m => m?.current?.apparent_temperature), base.current.apparent_temperature),
-            is_day: modeValue(models.map(m => m?.current?.is_day), base.current.is_day),
-            precipitation: avgValues(models.map(m => m?.current?.precipitation), base.current.precipitation),
-            weather_code: modeValue(models.map(m => m?.current?.weather_code), base.current.weather_code),
-            cloud_cover: avgValues(models.map(m => m?.current?.cloud_cover), base.current.cloud_cover),
-            pressure_msl: avgValues(models.map(m => m?.current?.pressure_msl), base.current.pressure_msl),
-            surface_pressure: avgValues(models.map(m => m?.current?.surface_pressure), base.current.surface_pressure),
-            wind_speed_10m: avgValues(models.map(m => m?.current?.wind_speed_10m), base.current.wind_speed_10m),
-            wind_direction_10m: avgAngle(models.map(m => m?.current?.wind_direction_10m), base.current.wind_direction_10m),
-            wind_gusts_10m: avgValues(models.map(m => m?.current?.wind_gusts_10m), base.current.wind_gusts_10m)
-        },
-        hourly: {
-            time: base.hourly?.time || [],
-            temperature_2m: aggregateSeries(models, 'hourly', 'temperature_2m'),
-            weather_code: aggregateSeries(models, 'hourly', 'weather_code', 'mode'),
-            precipitation_probability: aggregateSeries(models, 'hourly', 'precipitation_probability'),
-            precipitation: aggregateSeries(models, 'hourly', 'precipitation'),
-            is_day: aggregateSeries(models, 'hourly', 'is_day', 'mode'),
-            wind_speed_10m: aggregateSeries(models, 'hourly', 'wind_speed_10m')
-        },
-        daily: {
-            time: base.daily?.time || [],
-            weather_code: aggregateSeries(models, 'daily', 'weather_code', 'mode'),
-            temperature_2m_max: aggregateSeries(models, 'daily', 'temperature_2m_max'),
-            temperature_2m_min: aggregateSeries(models, 'daily', 'temperature_2m_min'),
-            sunrise: aggregateSeries(models, 'daily', 'sunrise', 'iso'),
-            sunset: aggregateSeries(models, 'daily', 'sunset', 'iso'),
-            precipitation_sum: aggregateSeries(models, 'daily', 'precipitation_sum'),
-            precipitation_probability_max: aggregateSeries(models, 'daily', 'precipitation_probability_max'),
-            wind_speed_10m_max: aggregateSeries(models, 'daily', 'wind_speed_10m_max'),
-            uv_index_max: aggregateSeries(models, 'daily', 'uv_index_max')
-        },
-        _consensus: {
-            sourceCount: models.length,
-            sourceNames: models.map(m => m._model)
-        }
-    };
-}
-async function fetchConsensusForecast() {
-    try {
-        const settled = await Promise.allSettled(WEATHER_CONSENSUS_MODELS.map(model => fetchForecastModel(model)));
-        const successful = settled
-            .filter(item => item.status === 'fulfilled')
-            .map(item => item.value)
-            .filter(m => m && m.current && m.hourly && m.daily);
-
-        if (successful.length > 0) {
-            return buildConsensusForecast(successful);
-        }
-    } catch (e) {
-        console.warn("Попытка мультимодельного консенсуса не удалась, переход на стандартный запрос.", e);
-    }
-
-    // Полный резервный вариант — один стандартный запрос прогноза Open-Meteo
-    const fallback = await fetchForecastModel('');
-    return buildConsensusForecast([fallback]);
+        + `&timezone=auto&forecast_days=7`;
+        
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Сбой загрузки прогноза с Open-Meteo');
+    return await res.json();
 }
 
 // ===== Utils =====
@@ -1260,7 +1135,7 @@ function doSearch() {
     fetchCity(q);
 }
 
-// ===== Geolocation: IP first, then fallback silently to default coordinates =====
+// ===== Geolocation =====
 async function initLocation() {
     showLoading('Определяем местоположение...');
     let gotLocation = false;
@@ -1296,7 +1171,7 @@ async function initLocation() {
         }
     } catch(e) {}
 
-    // Если IP-геолокация не сработала, бесшумно загружаем дефолтный город (Москва) без ошибок
+    // Бесшумный переход на Москву, если все IP API заблокированы или недоступны
     if (!gotLocation) {
         LAT = 55.7558;
         LON = 37.6173;
@@ -1304,7 +1179,6 @@ async function initLocation() {
     }
 }
 
-// Запрос геопозиции только при явном клике пользователя на кнопку GPS
 function geoLocate() {
     showLoading('Определяем местоположение...');
     if (!navigator.geolocation) {
@@ -1317,11 +1191,11 @@ function geoLocate() {
         p => {
             LAT = p.coords.latitude;
             LON = p.coords.longitude;
-            snack('📍 Координаты успешно обновлены по GPS');
+            snack('📍 Координаты обновлены по GPS');
             fetchWeather();
         },
         err => {
-            snack('Не удалось получить координаты. Пожалуйста, разрешите доступ в настройках.');
+            snack('Не удалось получить GPS. Разрешите доступ к геопозиции в браузере.');
             fetchWeather();
         },
         { timeout: 8000, enableHighAccuracy: true, maximumAge: 300000 }
@@ -1333,7 +1207,7 @@ async function fetchCity(name) {
     try {
         let chosen = null;
 
-        // Попробуем сначала быстрый и стабильный API Open-Meteo Geocoding
+        // Использование стабильного Geocoding API от Open-Meteo
         try {
             const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=ru&format=json`);
             if (r.ok) {
@@ -1347,10 +1221,10 @@ async function fetchCity(name) {
                 }
             }
         } catch(e) {
-            console.warn("Ошибка Geocoding API, пробуем Nominatim...", e);
+            console.warn("Geocoding API недоступен, пробуем резерв...", e);
         }
 
-        // Если Open-Meteo не нашёл, пробуем резервный Nominatim
+        // Запасной Nominatim
         if (!chosen) {
             try {
                 const nominatimRes = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&accept-language=ru&addressdetails=1&limit=1&q=${encodeURIComponent(name)}`);
@@ -1366,13 +1240,13 @@ async function fetchCity(name) {
                     }
                 }
             } catch(e) {
-                console.warn("Ошибка Nominatim", e);
+                console.warn("Резервный поиск недоступен", e);
             }
         }
 
         if (!chosen) {
             snack('Место не найдено');
-            fetchWeather(); // Возвращаем текущую погоду
+            fetchWeather();
             return;
         }
 
@@ -1394,6 +1268,8 @@ async function fetchWeather(cityName) {
     showLoading('Загрузка погоды...');
     try {
         let city = cityName;
+        
+        // Попытка обратного декодирования в фоне, не мешая основному процессу
         if (!city) {
             try {
                 const rgr = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${LAT}&lon=${LON}&format=jsonv2&addressdetails=1&accept-language=ru`);
@@ -1402,14 +1278,14 @@ async function fetchWeather(cityName) {
                     city = buildLocationLabel(rgd.address) || rgd.display_name;
                 }
             } catch(e) {
-                console.warn("Обратное геокодирование не удалось:", e);
+                console.warn("Не удалось получить имя города:", e);
             }
             if (!city) {
                 city = `${LAT.toFixed(2)}°, ${LON.toFixed(2)}°`;
             }
         }
 
-        const data = await fetchConsensusForecast();
+        const data = await fetchWeatherForecast();
 
         if (data.daily?.sunrise?.[0] && data.daily?.sunset?.[0]) {
             applyAutoTheme(data.daily.sunrise[0], data.daily.sunset[0]);
@@ -1417,7 +1293,7 @@ async function fetchWeather(cityName) {
 
         render(data, city);
     } catch (e) {
-        snack('Ошибка загрузки данных погоды');
+        snack('Ошибка загрузки погодных данных');
         console.error(e);
         document.getElementById('app').innerHTML = `
             <div class="loading">
@@ -1490,7 +1366,7 @@ function render(data, city) {
         </div>
     </div>
 
-    ${getInfoBanner('summary', { temp: cur.temperature_2m, feels: cur.apparent_temperature, desc: wmo.desc, humidity: cur.relative_humidity_2m, wind: cur.wind_speed_10m, consensusCount: data._consensus?.sourceCount })}
+    ${getInfoBanner('summary', { temp: cur.temperature_2m, feels: cur.apparent_temperature, desc: wmo.desc, humidity: cur.relative_humidity_2m, wind: cur.wind_speed_10m })}
 
     <div class="stats reveal d2">
         <div class="stat">
